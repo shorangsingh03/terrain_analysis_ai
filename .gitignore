@@ -1,0 +1,14 @@
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Python
+backend/venv/
+backend/__pycache__/
+*.pyc
+
+# AI & Temp Assets
+backend/temp_uploads/
+backend/output_assets/
+backend/datasets/
+.env
