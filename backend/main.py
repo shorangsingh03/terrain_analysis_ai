@@ -1,14 +1,14 @@
+import subprocess
 import os
 import shutil
-from fastapi import FastAPI, File, UploadFile
+import sys
+import cv2
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
-from extract_frames import extract_frames
-from hazard_engine import analyze_dem_hazards_from_matrix
-from ml_terrain_engine import ml_engine
-
-app = FastAPI(title="AeroTerrain AI Engine API")
+app = FastAPI(title="AeroTerrain Local Engine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,45 +18,100 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TEMP_DIR = os.path.join(BASE_DIR, "temp_uploads")
-OUTPUT_DIR = os.path.join(BASE_DIR, "output_assets")
-FRAMES_DIR = os.path.join(OUTPUT_DIR, "frames")
-MESH_DIR = os.path.join(OUTPUT_DIR, "3d_mesh")
+OUTPUT_DIR = os.path.abspath("backend/output_assets")
+UPLOAD_DIR = os.path.abspath("backend/temp_uploads")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-os.makedirs(TEMP_DIR, exist_ok=True)
-os.makedirs(FRAMES_DIR, exist_ok=True)
-os.makedirs(MESH_DIR, exist_ok=True)
+app.mount("/output_assets", StaticFiles(directory=OUTPUT_DIR), name="output_assets")
 
-app.mount(
-    "/output_assets", StaticFiles(directory=OUTPUT_DIR), name="output_assets"
-)
+def find_blender_binary():
+    # 1. Check environment variable override
+    env_path = os.environ.get("BLENDER_PATH")
+    if env_path and os.path.exists(env_path):
+        return env_path
 
+    # 2. Check System PATH
+    blender_cli = shutil.which("blender")
+    if blender_cli:
+        return blender_cli
 
-@app.get("/")
-def read_root():
-    return {"status": "AeroTerrain AI Engine API running"}
+    # 3. Search standard Windows installation directories
+    standard_paths = [
+        r"C:\Program Files\Blender Foundation\Blender 4.3\blender.exe",
+        r"C:\Program Files\Blender Foundation\Blender 4.2\blender.exe",
+        r"C:\Program Files\Blender Foundation\Blender 4.1\blender.exe",
+        r"C:\Program Files\Blender Foundation\Blender 4.0\blender.exe",
+        r"C:\Program Files\Blender Foundation\Blender 3.6\blender.exe",
+        r"C:\Program Files\Blender Foundation\Blender 3.5\blender.exe",
+    ]
+    for p in standard_paths:
+        if os.path.exists(p):
+            return p
 
+    return None
 
-@app.post("/api/process-video")
-def process_video(file: UploadFile = File(...)):
-    video_path = os.path.join(TEMP_DIR, file.filename)
-    with open(video_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+def extract_texture_from_video(video_path, output_texture_path):
+    cap = cv2.VideoCapture(video_path)
+    success, frame = cap.read()
+    if success:
+        cv2.imwrite(output_texture_path, frame)
+    cap.release()
 
-    frames = extract_frames(video_path, FRAMES_DIR, target_fps=1)
-    target_frame = (
-        frames[0]
-        if (frames and len(frames) > 0)
-        else os.path.join(FRAMES_DIR, "frame_0000.jpg")
-    )
+@app.post("/api/upload-video")
+async def process_video(
+    file: UploadFile = File(...),
+    height_scale: str = Form("1.8"),
+    foliage_blur: str = Form("8"),
+    edge_feathering: str = Form("12")
+):
+    video_path = os.path.join(UPLOAD_DIR, "source_video.mp4")
+    texture_path = os.path.join(OUTPUT_DIR, "texture.jpg")
+    
+    with open(video_path, "wb") as b:
+        shutil.copyfileobj(file.file, b)
 
-    elevation_matrix = ml_engine.predict_depth_map(target_frame)
-    ml_engine.export_textured_obj(target_frame, elevation_matrix, MESH_DIR)
-    metrics = analyze_dem_hazards_from_matrix(elevation_matrix)
+    extract_texture_from_video(video_path, texture_path)
+
+    script = os.path.abspath("backend/process_3d.py")
+    cmd = [sys.executable, script, video_path, height_scale, foliage_blur, edge_feathering]
+    
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as e:
+        print("Mesh Generation Error:", e.stderr or e.stdout)
+        raise HTTPException(status_code=500, detail="Error generating 3D terrain mesh.")
 
     return {
         "status": "success",
-        "metrics": metrics,
-        "elevation_matrix": elevation_matrix.tolist(),
+        "mesh_url": "http://localhost:8000/output_assets/terrain.obj",
+        "texture_url": "http://localhost:8000/output_assets/texture.jpg"
     }
+
+class SimReq(BaseModel):
+    mesh_filename: str = "terrain.obj"
+
+@app.post("/api/simulate-landslide")
+async def simulate(payload: SimReq):
+    mesh_path = os.path.join(OUTPUT_DIR, payload.mesh_filename)
+    texture_path = os.path.join(OUTPUT_DIR, "texture.jpg")
+    sim_script = os.path.abspath("backend/run_blender_sim.py")
+
+    blender_exe = find_blender_binary()
+    if not blender_exe:
+        raise HTTPException(
+            status_code=500, 
+            detail="Blender binary not found on machine. Please install Blender or add it to System PATH."
+        )
+
+    cmd = [blender_exe, "-b", "-P", sim_script, "--", mesh_path, texture_path]
+
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return {
+            "status": "success",
+            "video_url": "http://localhost:8000/output_assets/landslide_render.mp4"
+        }
+    except subprocess.CalledProcessError as e:
+        err_msg = e.stderr if e.stderr else e.stdout
+        raise HTTPException(status_code=500, detail=f"Blender Execution Failed: {err_msg[:250]}")
